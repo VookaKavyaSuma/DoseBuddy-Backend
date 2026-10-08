@@ -8,6 +8,8 @@ import com.example.dosebuddy.model.User;
 import com.example.dosebuddy.model.UserRole;
 import com.example.dosebuddy.repository.UserRepository;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+import org.springframework.security.oauth2.jwt.JwsHeader;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.jwt.JwtClaimsSet;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
@@ -16,6 +18,7 @@ import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
+import java.util.UUID;
 
 @Service
 public class AuthService {
@@ -42,7 +45,7 @@ public class AuthService {
         if (request.getPassword() == null || request.getPassword().length() < 6) {
             throw new IllegalArgumentException("Password must be at least 6 characters long.");
         }
-        if (userRepository.existsByEmail(request.getEmail())) {
+        if (userRepository.existsByEmail(request.getEmail().trim().toLowerCase())) {
             throw new IllegalArgumentException("An account with this email already exists.");
         }
 
@@ -52,10 +55,11 @@ public class AuthService {
         }
 
         String encodedPassword = passwordEncoder.encode(request.getPassword());
+        String userId = "usr_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
 
         User user = new User(
-                null,
-                request.getEmail().trim(),
+                userId,
+                request.getEmail().trim().toLowerCase(),
                 username.trim(),
                 request.getFullName() != null ? request.getFullName().trim() : "User",
                 encodedPassword,
@@ -76,7 +80,7 @@ public class AuthService {
             throw new IllegalArgumentException("Please enter your password.");
         }
 
-        User user = userRepository.findByEmailOrUsername(request.getUsernameOrEmail())
+        User user = userRepository.findByEmailOrUsername(request.getUsernameOrEmail().trim().toLowerCase())
                 .orElseThrow(() -> new IllegalArgumentException("Invalid email/username or password."));
 
         if (!passwordEncoder.matches(request.getPassword(), user.getPassword())) {
@@ -90,7 +94,7 @@ public class AuthService {
     public AuthResponse demoLogin(UserRole role) {
         String email = (role == UserRole.PATIENT) ? "patient@dosebuddy.com" : "caregiver@dosebuddy.com";
         User user = userRepository.findByEmail(email)
-                .orElseThrow(() -> new RuntimeException("Demo user not found"));
+                .orElseThrow(() -> new RuntimeException("Demo user not found: " + email));
 
         String token = generateJwtToken(user);
         return new AuthResponse(token, new UserDto(user), "Logged in with demo " + role + " account!");
@@ -127,6 +131,8 @@ public class AuthService {
                 .claim("fullName", user.getFullName())
                 .build();
 
-        return jwtEncoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
+        // Crucial fix: Specify JwsHeader with MacAlgorithm.HS256 for symmetric key signing
+        JwsHeader jwsHeader = JwsHeader.with(MacAlgorithm.HS256).build();
+        return jwtEncoder.encode(JwtEncoderParameters.from(jwsHeader, claims)).getTokenValue();
     }
 }

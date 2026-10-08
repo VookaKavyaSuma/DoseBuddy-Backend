@@ -1,8 +1,11 @@
 package com.example.dosebuddy.service;
 
+import com.example.dosebuddy.model.ChatMessage;
+import com.example.dosebuddy.model.ChatMessageEntity;
+import com.example.dosebuddy.repository.ChatMessageRepository;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
-import com.example.dosebuddy.model.ChatMessage;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -14,30 +17,45 @@ import java.util.stream.Collectors;
 @Service
 public class ChatService {
     private final ChatClient chatClient;
-    
-    // In-memory conversation storage mapped by conversationId
+    private final ChatMessageRepository chatMessageRepository;
+
+    // In-memory conversation storage cache mapped by conversationId
     private final Map<String, List<ChatMessage>> conversationStore = new ConcurrentHashMap<>();
 
     // Document context chunks stored per conversation for RAG
     private final Map<String, List<String>> documentStore = new ConcurrentHashMap<>();
 
-    public ChatService(ChatClient.Builder chatClientBuilder) {
+    public ChatService(ChatClient.Builder chatClientBuilder, ChatMessageRepository chatMessageRepository) {
         this.chatClient = chatClientBuilder.build();
+        this.chatMessageRepository = chatMessageRepository;
     }
 
     public String generateResponse(String message, String conversationId) {
         String convId = (conversationId == null || conversationId.isBlank()) ? "default_session" : conversationId;
 
         // 1. Retrieve or initialize conversation message list
-        List<ChatMessage> history = conversationStore.computeIfAbsent(convId, k -> Collections.synchronizedList(new ArrayList<>()));
+        List<ChatMessage> history = conversationStore.computeIfAbsent(convId, k -> {
+            // Pre-load from MySQL if exists
+            List<ChatMessageEntity> dbMsgs = chatMessageRepository.findByConversationIdOrderByTimestampAsc(convId);
+            List<ChatMessage> list = new ArrayList<>();
+            for (ChatMessageEntity entity : dbMsgs) {
+                list.add(entity.toDto());
+            }
+            return Collections.synchronizedList(list);
+        });
 
-        // 2. Save incoming user message
-        history.add(new ChatMessage("user", message));
+        // 2. Save incoming user message to memory and MySQL
+        ChatMessage userMsg = new ChatMessage("user", message);
+        history.add(userMsg);
+        try {
+            chatMessageRepository.save(new ChatMessageEntity(convId, "user", message));
+        } catch (Exception e) {
+            System.err.println("Failed to persist user chat message to database: " + e.getMessage());
+        }
 
         // 3. Format previous conversation context
         StringBuilder historyContext = new StringBuilder();
         synchronized (history) {
-            // Include up to last 10 messages to keep context concise and relevant
             int startIdx = Math.max(0, history.size() - 11);
             for (int i = startIdx; i < history.size() - 1; i++) {
                 ChatMessage m = history.get(i);
@@ -49,7 +67,6 @@ public class ChatService {
         List<String> docChunks = documentStore.get(convId);
         String docContext = "";
         if (docChunks != null && !docChunks.isEmpty()) {
-            // Find relevant chunks matching query terms, or include top chunks
             String queryLower = message.toLowerCase();
             List<String> matched = docChunks.stream()
                 .filter(chunk -> {
@@ -105,8 +122,14 @@ public class ChatService {
             aiResponse = generateSmartFallback(message, docContext);
         }
 
-        // 6. Save AI response to history
-        history.add(new ChatMessage("ai", aiResponse));
+        // 6. Save AI response to history and MySQL
+        ChatMessage aiMsg = new ChatMessage("ai", aiResponse);
+        history.add(aiMsg);
+        try {
+            chatMessageRepository.save(new ChatMessageEntity(convId, "ai", aiResponse));
+        } catch (Exception e) {
+            System.err.println("Failed to persist AI chat message to database: " + e.getMessage());
+        }
 
         return aiResponse;
     }
@@ -115,17 +138,39 @@ public class ChatService {
         if (conversationId == null || conversationId.isBlank()) {
             return Collections.emptyList();
         }
+        
         List<ChatMessage> list = conversationStore.get(conversationId);
-        if (list == null) return Collections.emptyList();
-        synchronized (list) {
-            return new ArrayList<>(list);
+        if (list != null && !list.isEmpty()) {
+            synchronized (list) {
+                return new ArrayList<>(list);
+            }
         }
+
+        // Fallback to MySQL if memory cache was cleared or freshly restarted
+        try {
+            List<ChatMessageEntity> dbMsgs = chatMessageRepository.findByConversationIdOrderByTimestampAsc(conversationId);
+            if (!dbMsgs.isEmpty()) {
+                List<ChatMessage> result = dbMsgs.stream().map(ChatMessageEntity::toDto).collect(Collectors.toList());
+                conversationStore.put(conversationId, Collections.synchronizedList(new ArrayList<>(result)));
+                return result;
+            }
+        } catch (Exception e) {
+            System.err.println("Failed to load chat history from database: " + e.getMessage());
+        }
+
+        return Collections.emptyList();
     }
 
+    @Transactional
     public void clearHistory(String conversationId) {
         if (conversationId != null) {
             conversationStore.remove(conversationId);
             documentStore.remove(conversationId);
+            try {
+                chatMessageRepository.deleteByConversationId(conversationId);
+            } catch (Exception e) {
+                System.err.println("Failed to delete chat history from database: " + e.getMessage());
+            }
         }
     }
 
